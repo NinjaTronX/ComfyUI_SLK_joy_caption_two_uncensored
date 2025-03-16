@@ -1,0 +1,2405 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+
+Additional Info:
+----------------
+
+================================================================
+Directory Structure
+================================================================
+__init__.py
+.github/workflows/publish.yml
+joy_caption_two_node.py
+joy_config.json
+joy_config.py
+LICENSE
+pyproject.toml
+readme_us.md
+readme.md
+requirements.txt
+translation/zh-CN/Nodes/Comfyui_SLK_joy_caption_two.json
+uitls.py
+
+================================================================
+Files
+================================================================
+
+================
+File: __init__.py
+================
+from .joy_caption_two_node import Joy_caption_two
+from .joy_caption_two_node import Joy_caption_two_advanced
+from .joy_caption_two_node import Batch_joy_caption_two_advanced
+from .joy_caption_two_node import Batch_joy_caption_two
+from .joy_caption_two_node import Joy_caption_two_load
+from .joy_caption_two_node import Joy_extra_options
+
+NODE_CLASS_MAPPINGS = {
+    "Joy_caption_two": Joy_caption_two,
+    "Joy_caption_two_advanced": Joy_caption_two_advanced,
+    "Batch_joy_caption_two": Batch_joy_caption_two,
+    "Batch_joy_caption_two_advanced": Batch_joy_caption_two_advanced,
+    "Joy_caption_two_load": Joy_caption_two_load,
+    "Joy_extra_options": Joy_extra_options,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "Joy_caption_two": "Joy Caption Two",
+    "Joy_caption_two_advanced": "Joy Caption Two Advanced",
+    "Batch_joy_caption_two": "Batch Joy Caption Two",
+    "Batch_joy_caption_two_advanced": "Batch Joy Caption Two Advanced",
+    "Joy_caption_two_load": "Joy Caption Two Load",
+    "Joy_extra_options": "Joy Caption Extra Options",
+}
+
+================
+File: .github/workflows/publish.yml
+================
+name: Publish to Comfy registry
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "pyproject.toml"
+
+jobs:
+  publish-node:
+    name: Publish Custom Node to registry
+    runs-on: ubuntu-latest
+    # if this is a forked repository. Skipping the workflow.
+    if: github.event.repository.fork == false 
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Publish Custom Node
+        uses: Comfy-Org/publish-node-action@main
+        with:
+          ## Add your own personal access token to your Github Repository secrets and reference it here.
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+
+================
+File: joy_caption_two_node.py
+================
+import shutil
+import time
+
+import numpy as np
+from torch import nn
+from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast, \
+    AutoModelForCausalLM
+from pathlib import Path
+import torch
+import torch.amp.autocast_mode
+from PIL import Image
+import os
+
+import comfy.model_management
+import comfy.utils
+import folder_paths
+import torchvision.transforms.functional as TVF
+
+from comfy.model_management import get_torch_device, get_free_memory
+
+from comfy.model_management import load_models_gpu, text_encoder_dtype
+from comfy.model_patcher import ModelPatcher
+from .uitls import download_hg_model, modify_json_value, clear_cache
+from .joy_config import joy_config
+
+DEVICE = get_torch_device()
+
+BASE_MODEL_PATH = Path(folder_paths.models_dir, "Joy_caption_two")
+
+def tensor2pil(t_image: torch.Tensor)  -> Image:
+    return Image.fromarray(np.clip(255.0 * t_image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+
+class JoyClipVisionModel:
+    def __init__(self, load_device, offload_device):
+        self.load_device = load_device
+        self.offload_device = offload_device
+        self.type = text_encoder_dtype()
+
+        # clip
+        model_id = "google/siglip-so400m-patch14-384"
+        CLIP_PATH = download_hg_model(model_id, "clip")
+
+        clip_model = AutoModel.from_pretrained(
+            CLIP_PATH,
+            trust_remote_code=True,
+            torch_dtype=self.type
+        )
+
+        clip_model = clip_model.vision_model
+
+        assert (BASE_MODEL_PATH / "clip_model.pt").exists()
+        print("Loading VLM's custom vision model")
+        checkpoint = torch.load(BASE_MODEL_PATH / "clip_model.pt", map_location='cpu', weights_only=True)
+        checkpoint = {k.replace("_orig_mod.module.", ""): v for k, v in checkpoint.items()}
+        clip_model.load_state_dict(checkpoint)
+        del checkpoint
+
+        clip_model.eval()
+        clip_model.requires_grad_(False)
+        self.model = clip_model
+
+        self.patcher = ModelPatcher(self.model, load_device=self.load_device, offload_device=self.offload_device)
+
+    def encode_image(self, pixel_values):
+        #print(f"{id(self)}之前 in JoyClipVisionModel: {next(self.model.parameters()).device}")  # 打印模型参数的设备
+        load_models_gpu([self.patcher], force_full_load=True, force_patch_weights=True)
+        #print(f"之后 in JoyClipVisionModel: {next(self.model.parameters()).device}")  # 打印模型参数的设备
+        vision_outputs = self.model(pixel_values=pixel_values, output_hidden_states=True)
+        return vision_outputs
+
+
+
+
+class ImageAdapter(nn.Module):
+    def __init__(self, input_features: int, output_features: int, ln1: bool, pos_emb: bool, num_image_tokens: int, deep_extract: bool):
+        super().__init__()
+        self.deep_extract = deep_extract
+        if self.deep_extract:
+            input_features = input_features * 5
+
+        self.linear1 = nn.Linear(input_features, output_features)
+        self.activation = nn.GELU()
+        self.linear2 = nn.Linear(output_features, output_features)
+        self.ln1 = nn.Identity() if not ln1 else nn.LayerNorm(input_features)
+        self.pos_emb = None if not pos_emb else nn.Parameter(torch.zeros(num_image_tokens, input_features))
+        # Other tokens (<|image_start|>, <|image_end|>, <|eot_id|>)
+        self.other_tokens = nn.Embedding(3, output_features)
+        self.other_tokens.weight.data.normal_(mean=0.0, std=0.02)   # Matches HF's implementation of llama3
+    def forward(self, vision_outputs: torch.Tensor):
+        if self.deep_extract:
+            x = torch.concat((
+				vision_outputs[-2],
+				vision_outputs[3],
+				vision_outputs[7],
+				vision_outputs[13],
+				vision_outputs[20],
+			), dim=-1)
+            assert len(x.shape) == 3, f"Expected 3, got {len(x.shape)}"  # batch, tokens, features
+            assert x.shape[-1] == vision_outputs[-2].shape[-1] * 5, f"Expected {vision_outputs[-2].shape[-1] * 5}, got {x.shape[-1]}"
+        else:
+            x = vision_outputs[-2]
+
+        x = self.ln1(x)
+
+        if self.pos_emb is not None:
+            assert x.shape[-2:] == self.pos_emb.shape, f"Expected {self.pos_emb.shape}, got {x.shape[-2:]}"
+            x = x + self.pos_emb
+
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.linear2(x)
+
+        # <|image_start|>, IMAGE, <|image_end|>
+        other_tokens = self.other_tokens(torch.tensor([0, 1], device=self.other_tokens.weight.device).expand(x.shape[0], -1))
+        assert other_tokens.shape == (x.shape[0], 2, x.shape[2]), f"Expected {(x.shape[0], 2, x.shape[2])}, got {other_tokens.shape}"
+        x = torch.cat((other_tokens[:, 0:1], x, other_tokens[:, 1:2]), dim=1)
+        return x
+
+    def get_eot_embedding(self):
+        return self.other_tokens(torch.tensor([2], device=self.other_tokens.weight.device)).squeeze(0)
+
+
+class JoyImageAdapter:
+    def __init__(self, load_device, offload_device):
+        self.load_device = load_device
+        self.offload_device = offload_device
+
+        # Image Adapter
+        adapter_path = os.path.join(BASE_MODEL_PATH, "image_adapter.pt")
+
+        image_adapter = ImageAdapter(1152, 4096, False, False, 38,
+                                     False)  # ImageAdapter(clip_model.config.hidden_size, 4096)
+        image_adapter.load_state_dict(torch.load(adapter_path, map_location=self.offload_device, weights_only=True))
+        img_dtype = text_encoder_dtype()
+        image_adapter = image_adapter.to(img_dtype)
+        image_adapter.eval()
+        self.image_adapter = image_adapter
+
+        self.patcher = ModelPatcher(self.image_adapter, load_device=self.load_device,
+                                    offload_device=self.offload_device)
+
+    def embedded_image(self, hidden_states):
+        load_models_gpu([self.patcher], force_full_load=True, force_patch_weights=True)
+        embedded_images = self.image_adapter(hidden_states)
+        embedded_images.to(self.load_device)
+        return embedded_images
+
+class JoyLLM:
+    def __init__(self, load_device, offload_device, model_id):
+        self.load_device = load_device
+        self.offload_device = offload_device
+        self.type = text_encoder_dtype()
+        self.model_id = model_id
+        self.current_model_id = None
+
+        print("Loading tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained(os.path.join(BASE_MODEL_PATH, "text_model"), use_fast=True)
+        assert isinstance(tokenizer, PreTrainedTokenizer) or isinstance(tokenizer,
+                                                                        PreTrainedTokenizerFast), f"Tokenizer is of type {type(tokenizer)}"
+
+        self.tokenizer = tokenizer
+        self.text_model = None
+
+    def load_llm_model(self):
+        if self.text_model is None or self.current_model_id != self.model_id:
+            print(f"Loading LLM: {self.model_id}")
+            LLM_PATH = download_hg_model(self.model_id, "LLM")
+            text_model_path = os.path.join(BASE_MODEL_PATH, "text_model")
+            modify_json_value(os.path.join(text_model_path, "adapter_config.json"), "base_model_name_or_path",
+                              LLM_PATH)
+            max_retries = 5  # 设置最大重试次数
+            retries = 0
+            while True:
+                free_vram = get_free_memory()/1024/1024
+                # print(f"现在的显存{retries}:{free_vram}")
+                if free_vram > 6400:
+                    text_model = AutoModelForCausalLM.from_pretrained(text_model_path,
+                                                              device_map=self.load_device,
+                                                              local_files_only=True,
+                                                              trust_remote_code=True, torch_dtype=self.type)
+                    text_model.eval()
+                    self.text_model = text_model
+                    break
+                else:
+                    clear_cache()
+                    retries += 1
+                    if retries > max_retries:
+                        text_model = AutoModelForCausalLM.from_pretrained(text_model_path,
+                                                                          device_map=self.load_device,
+                                                                          local_files_only=True,
+                                                                          trust_remote_code=True,
+                                                                          torch_dtype=self.type)
+                        text_model.eval()
+                        self.text_model = text_model
+                        break
+                    time.sleep(1 + retries / 2)
+            # print(f"现在呢:{get_free_memory()/1024/1024}")
+            self.current_model_id = self.model_id
+        return self.text_model
+
+    def clear_gpu(self, low_vram):
+        del self.text_model
+        self.text_model = None
+        self.current_model_id = None
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        if low_vram:
+            clear_cache()
+
+
+class JoyTwoPipeline:
+    def __init__(self, load_device, offload_device):
+        self.load_device = load_device
+        self.offload_device = offload_device
+        self.clip_model: JoyClipVisionModel | None = None
+        self.image_adapter: JoyImageAdapter | None = None
+        self.llm: JoyLLM | None = None
+        self.parent = None
+        self.model = None
+
+    def clearCache(self):
+        self.clip_model = None
+        self.image_adapter = None
+        self.model = None
+
+    def loadModels(self):
+        # clip
+        self.clip_model = JoyClipVisionModel(self.load_device, self.offload_device)
+
+        self.image_adapter = JoyImageAdapter(self.load_device, self.offload_device)
+
+    def loadLLM(self, model_id):
+        if self.llm is None:
+            self.llm = JoyLLM(self.load_device, self.offload_device, model_id)
+        else:
+            self.llm.model_id = model_id
+
+
+class Joy_caption_two_load:
+
+    def __init__(self):
+        self.model = None
+        self.load_device = comfy.model_management.text_encoder_device()
+        self.offload_device = comfy.model_management.text_encoder_offload_device()
+        self.pipeline = JoyTwoPipeline(self.load_device, self.offload_device)
+        self.pipeline.parent = self
+
+    @classmethod
+    def INPUT_TYPES(s):
+        models = joy_config["model"]
+        return {
+            "required": {
+                "model": (models, ),
+            }
+        }
+
+    CATEGORY = "SLK/LLM"
+    RETURN_TYPES = ("JoyTwoPipeline",)
+    FUNCTION = "generate"
+
+    def loadModels(self):
+        self.pipeline.loadModels()
+
+    def generate(self, model):
+        if self.model is None or self.model != model or self.pipeline is None:
+            self.model = model
+            self.loadModels()
+        self.pipeline.model = model
+        return (self.pipeline,)
+
+
+class Joy_caption_two:
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        caption_lengths = list(joy_config["CAPTION_LENGTH"])
+        caption_types = list(joy_config["CAPTION_TYPE_MAP"].keys())
+        return {
+            "required": {
+                "joy_two_pipeline": ("JoyTwoPipeline",),
+                "image": ("IMAGE",),
+                "caption_type": (caption_types, {}),
+                "caption_length": (caption_lengths, {"default": "long"}),
+                "low_vram": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    CATEGORY = "SLK/LLM"
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "generate"
+
+    def generate(self, joy_two_pipeline: JoyTwoPipeline, image, caption_type, caption_length, low_vram):
+        torch.cuda.empty_cache()
+
+        if joy_two_pipeline.clip_model is None:
+            joy_two_pipeline.parent.loadModels()
+
+        # 'any' means no length specified
+        length = None if caption_length == "any" else caption_length
+
+        if isinstance(length, str):
+            try:
+                length = int(length)
+            except ValueError:
+                pass
+
+        # Build prompt
+        if length is None:
+            map_idx = 0
+        elif isinstance(length, int):
+            map_idx = 1
+        elif isinstance(length, str):
+            map_idx = 2
+        else:
+            raise ValueError(f"Invalid caption length: {length}")
+
+        caption_type_map = joy_config["CAPTION_TYPE_MAP"]
+        prompt_str = list(caption_type_map[caption_type])[map_idx]
+
+        prompt_str = prompt_str.format(length=caption_length, word_count=caption_length)
+
+        # For debugging
+        # print(f"Prompt: {prompt_str}")
+
+        # Preprocess image
+        # NOTE: I found the default processor for so400M to have worse results than just using PIL directly
+        # image = clip_processor(images=input_image, return_tensors='pt').pixel_values
+        image = tensor2pil(image)
+        image = image.resize((384, 384), Image.LANCZOS)
+        pixel_values = TVF.pil_to_tensor(image).unsqueeze(0) / 255.0
+        pixel_values = TVF.normalize(pixel_values, [0.5], [0.5])
+        pixel_values = pixel_values.to(joy_two_pipeline.load_device)
+
+        # Embed image
+        # This results in Batch x Image Tokens x Features
+        with torch.amp.autocast_mode.autocast('cuda', enabled=True):
+            vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
+            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
+
+        if low_vram:
+            pixel_values.to(joy_two_pipeline.offload_device)
+            clear_cache()
+
+        # Build the conversation
+        convo = [
+            {
+                "role": "system",
+                "content": "You are a helpful image captioner.",
+            },
+            {
+                "role": "user",
+                "content": prompt_str,
+            },
+        ]
+
+        joy_two_pipeline.loadLLM(joy_two_pipeline.model)
+
+        tokenizer = joy_two_pipeline.llm.tokenizer
+        # Format the conversation
+        convo_string = tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
+        assert isinstance(convo_string, str)
+
+        # Tokenize the conversation
+        # prompt_str is tokenized separately so we can do the calculations below
+        convo_tokens = tokenizer.encode(convo_string, return_tensors="pt", add_special_tokens=False, truncation=False)
+        prompt_tokens = tokenizer.encode(prompt_str, return_tensors="pt", add_special_tokens=False, truncation=False)
+        assert isinstance(convo_tokens, torch.Tensor) and isinstance(prompt_tokens, torch.Tensor)
+        convo_tokens = convo_tokens.squeeze(0)  # Squeeze just to make the following easier
+        prompt_tokens = prompt_tokens.squeeze(0)
+
+        # Calculate where to inject the image
+        eot_id_indices = (convo_tokens == tokenizer.convert_tokens_to_ids("<|eot_id|>")).nonzero(as_tuple=True)[
+            0].tolist()
+        assert len(eot_id_indices) == 2, f"Expected 2 <|eot_id|> tokens, got {len(eot_id_indices)}"
+
+        preamble_len = eot_id_indices[1] - prompt_tokens.shape[0]  # Number of tokens before the prompt
+
+
+        text_model = joy_two_pipeline.llm.load_llm_model()
+        # Embed the tokens
+        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+
+        # Construct the input
+        input_embeds = torch.cat([
+            convo_embeds[:, :preamble_len],  # Part before the prompt
+            embedded_images.to(dtype=convo_embeds.dtype),  # Image
+            convo_embeds[:, preamble_len:],  # The prompt and anything after it
+        ], dim=1).to(joy_two_pipeline.load_device)
+
+        input_ids = torch.cat([
+            convo_tokens[:preamble_len].unsqueeze(0),
+            torch.zeros((1, embedded_images.shape[1]), dtype=torch.long),
+            # Dummy tokens for the image (TODO: Should probably use a special token here so as not to confuse any generation algorithms that might be inspecting the input)
+            convo_tokens[preamble_len:].unsqueeze(0),
+        ], dim=1).to(joy_two_pipeline.load_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        # Debugging
+        # print(f"Input to model: {repr(tokenizer.decode(input_ids[0]))}")
+
+        # generate_ids = text_model.generate(input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask, max_new_tokens=300, do_sample=False, suppress_tokens=None)
+        # generate_ids = text_model.generate(input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask, max_new_tokens=300, do_sample=True, top_k=10, temperature=0.5, suppress_tokens=None)
+        generate_ids = text_model.generate(input_ids, inputs_embeds=input_embeds, attention_mask=attention_mask,
+                                           max_new_tokens=300, do_sample=True,
+                                           suppress_tokens=None)  # Uses the default which is temp=0.6, top_p=0.9
+
+        # Trim off the prompt
+        generate_ids = generate_ids[:, input_ids.shape[1]:]
+        if generate_ids[0][-1] == tokenizer.eos_token_id or generate_ids[0][-1] == tokenizer.convert_tokens_to_ids(
+                "<|eot_id|>"):
+            generate_ids = generate_ids[:, :-1]
+
+        caption = tokenizer.batch_decode(generate_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
+
+        joy_two_pipeline.llm.clear_gpu(low_vram)
+
+        return (caption.strip(), )
+
+class Joy_caption_two_advanced:
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        caption_lengths = list(joy_config["CAPTION_LENGTH"])
+        caption_types = list(joy_config["CAPTION_TYPE_MAP"].keys())
+        return {
+            "required": {
+                "joy_two_pipeline": ("JoyTwoPipeline",),
+                "image": ("IMAGE",),
+                "extra_options": ("Extra_Options", ),
+                "caption_type": (caption_types, {}),
+                "caption_length": (caption_lengths, {"default": "long"}),
+                "name": ("STRING", {"default": ""}),
+                "custom_prompt": ("STRING", {"default": ""}),
+                "low_vram": ("BOOLEAN", {"default": False}),
+                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "temperature": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
+            }
+        }
+
+    CATEGORY = "SLK/LLM"
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "generate"
+
+    def generate(self, joy_two_pipeline: JoyTwoPipeline, image, extra_options, caption_type, caption_length, name, custom_prompt, low_vram, top_p, temperature):
+        torch.cuda.empty_cache()
+
+        if joy_two_pipeline.clip_model == None:
+            joy_two_pipeline.parent.loadModels()
+
+        # 'any' means no length specified
+        length = None if caption_length == "any" else caption_length
+
+        if isinstance(length, str):
+            try:
+                length = int(length)
+            except ValueError:
+                pass
+
+        # Build prompt
+        if length is None:
+            map_idx = 0
+        elif isinstance(length, int):
+            map_idx = 1
+        elif isinstance(length, str):
+            map_idx = 2
+        else:
+            raise ValueError(f"Invalid caption length: {length}")
+
+        caption_type_map = joy_config["CAPTION_TYPE_MAP"]
+        prompt_str = list(caption_type_map[caption_type])[map_idx]
+
+        # Add extra options
+        if len(extra_options) > 0:
+            prompt_str += " " + " ".join(extra_options)
+
+        # Add name, length, word_count
+        prompt_str = prompt_str.format(name=name, length=caption_length, word_count=caption_length)
+
+        if custom_prompt.strip() != "":
+            prompt_str = custom_prompt.strip()
+
+        # For debugging
+        print(f"Prompt: {prompt_str}")
+
+        # Preprocess image
+        # NOTE: I found the default processor for so400M to have worse results than just using PIL directly
+        # image = clip_processor(images=input_image, return_tensors='pt').pixel_values
+        image = tensor2pil(image)
+        image = image.resize((384, 384), Image.LANCZOS)
+        pixel_values = TVF.pil_to_tensor(image).unsqueeze(0) / 255.0
+        pixel_values = TVF.normalize(pixel_values, [0.5], [0.5])
+        pixel_values = pixel_values.to(joy_two_pipeline.load_device)
+
+        # Embed image
+        # This results in Batch x Image Tokens x Features
+        with torch.amp.autocast_mode.autocast('cuda', enabled=True):
+            vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
+            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
+
+        if low_vram:
+            pixel_values.to(joy_two_pipeline.offload_device)
+            clear_cache()
+
+        # Build the conversation
+        convo = [
+            {
+                "role": "system",
+                "content": "You are a helpful image captioner.",
+            },
+            {
+                "role": "user",
+                "content": prompt_str,
+            },
+        ]
+
+        joy_two_pipeline.loadLLM(joy_two_pipeline.model)
+
+        tokenizer = joy_two_pipeline.llm.tokenizer
+        # Format the conversation
+        convo_string = tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
+        assert isinstance(convo_string, str)
+
+        # Tokenize the conversation
+        # prompt_str is tokenized separately so we can do the calculations below
+        convo_tokens = tokenizer.encode(convo_string, return_tensors="pt", add_special_tokens=False, truncation=False)
+        prompt_tokens = tokenizer.encode(prompt_str, return_tensors="pt", add_special_tokens=False, truncation=False)
+        assert isinstance(convo_tokens, torch.Tensor) and isinstance(prompt_tokens, torch.Tensor)
+        convo_tokens = convo_tokens.squeeze(0)  # Squeeze just to make the following easier
+        prompt_tokens = prompt_tokens.squeeze(0)
+
+        # Calculate where to inject the image
+        eot_id_indices = (convo_tokens == tokenizer.convert_tokens_to_ids("<|eot_id|>")).nonzero(as_tuple=True)[
+            0].tolist()
+        assert len(eot_id_indices) == 2, f"Expected 2 <|eot_id|> tokens, got {len(eot_id_indices)}"
+
+        preamble_len = eot_id_indices[1] - prompt_tokens.shape[0]  # Number of tokens before the prompt
+
+
+        text_model = joy_two_pipeline.llm.load_llm_model()
+        # Embed the tokens
+        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+        # Construct the input
+        input_embeds = torch.cat([
+            convo_embeds[:, :preamble_len],  # Part before the prompt
+            embedded_images.to(dtype=convo_embeds.dtype),  # Image
+            convo_embeds[:, preamble_len:],  # The prompt and anything after it
+        ], dim=1).to(joy_two_pipeline.load_device)
+
+        input_ids = torch.cat([
+            convo_tokens[:preamble_len].unsqueeze(0),
+            torch.zeros((1, embedded_images.shape[1]), dtype=torch.long),
+            # Dummy tokens for the image (TODO: Should probably use a special token here so as not to confuse any generation algorithms that might be inspecting the input)
+            convo_tokens[preamble_len:].unsqueeze(0),
+        ], dim=1).to(joy_two_pipeline.load_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        # Debugging
+        # print(f"Input to model: {repr(tokenizer.decode(input_ids[0]))}")
+
+        # generate_ids = text_model.generate(input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask, max_new_tokens=300, do_sample=False, suppress_tokens=None)
+        # generate_ids = text_model.generate(input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask, max_new_tokens=300, do_sample=True, top_k=10, temperature=0.5, suppress_tokens=None)
+        generate_ids = text_model.generate(input_ids, inputs_embeds=input_embeds, attention_mask=attention_mask,
+                                           max_new_tokens=300, do_sample=True,
+                                           top_p=top_p, temperature=temperature,
+                                           suppress_tokens=None)  # Uses the default which is temp=0.6, top_p=0.9
+
+        # Trim off the prompt
+        generate_ids = generate_ids[:, input_ids.shape[1]:]
+        if generate_ids[0][-1] == tokenizer.eos_token_id or generate_ids[0][-1] == tokenizer.convert_tokens_to_ids(
+                "<|eot_id|>"):
+            generate_ids = generate_ids[:, :-1]
+
+        caption = tokenizer.batch_decode(generate_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
+
+        joy_two_pipeline.llm.clear_gpu(low_vram)
+
+        return (caption.strip(), )
+
+class Batch_joy_caption_two:
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        caption_lengths = list(joy_config["CAPTION_LENGTH"])
+        caption_types = list(joy_config["CAPTION_TYPE_MAP"].keys())
+        return {
+            "required": {
+                "joy_two_pipeline": ("JoyTwoPipeline",),
+                "input_dir": ("STRING", {"default": ""}),
+                "output_dir": ("STRING", {"default": ""}),
+                "caption_type": (caption_types, {}),
+                "caption_length": (caption_lengths, {"default": "long"}),
+                "low_vram": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    CATEGORY = "SLK/LLM"
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "generate"
+
+    def generate_caption(self, joy_two_pipeline: JoyTwoPipeline, image, prompt, low_vram=True):
+        torch.cuda.empty_cache()
+        pixel_values = TVF.pil_to_tensor(image).unsqueeze(0) / 255.0
+        pixel_values = TVF.normalize(pixel_values, [0.5], [0.5])
+        pixel_values = pixel_values.to(joy_two_pipeline.load_device)
+
+        # Embed image
+        # This results in Batch x Image Tokens x Features
+        with torch.amp.autocast_mode.autocast('cuda', enabled=True):
+            vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
+            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
+
+        if low_vram:
+            pixel_values.to(joy_two_pipeline.offload_device)
+            clear_cache()
+
+        # Build the conversation
+        convo = [
+            {
+                "role": "system",
+                "content": "You are a helpful image captioner.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ]
+
+        joy_two_pipeline.loadLLM(joy_two_pipeline.model)
+
+        tokenizer = joy_two_pipeline.llm.tokenizer
+        # Format the conversation
+        convo_string = tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
+        assert isinstance(convo_string, str)
+
+        # Tokenize the conversation
+        # prompt_str is tokenized separately so we can do the calculations below
+        convo_tokens = tokenizer.encode(convo_string, return_tensors="pt", add_special_tokens=False, truncation=False)
+        prompt_tokens = tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=False, truncation=False)
+        assert isinstance(convo_tokens, torch.Tensor) and isinstance(prompt_tokens, torch.Tensor)
+        convo_tokens = convo_tokens.squeeze(0)  # Squeeze just to make the following easier
+        prompt_tokens = prompt_tokens.squeeze(0)
+
+        # Calculate where to inject the image
+        eot_id_indices = (convo_tokens == tokenizer.convert_tokens_to_ids("<|eot_id|>")).nonzero(as_tuple=True)[
+            0].tolist()
+        assert len(eot_id_indices) == 2, f"Expected 2 <|eot_id|> tokens, got {len(eot_id_indices)}"
+
+        preamble_len = eot_id_indices[1] - prompt_tokens.shape[0]  # Number of tokens before the prompt
+
+        text_model = joy_two_pipeline.llm.load_llm_model()
+        # Embed the tokens
+        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+        # Construct the input
+        input_embeds = torch.cat([
+            convo_embeds[:, :preamble_len],  # Part before the prompt
+            embedded_images.to(dtype=convo_embeds.dtype),  # Image
+            convo_embeds[:, preamble_len:],  # The prompt and anything after it
+        ], dim=1).to(joy_two_pipeline.load_device)
+
+        input_ids = torch.cat([
+            convo_tokens[:preamble_len].unsqueeze(0),
+            torch.zeros((1, embedded_images.shape[1]), dtype=torch.long),
+            # Dummy tokens for the image (TODO: Should probably use a special token here so as not to confuse any generation algorithms that might be inspecting the input)
+            convo_tokens[preamble_len:].unsqueeze(0),
+        ], dim=1).to(joy_two_pipeline.load_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        # Debugging
+        # print(f"Input to model: {repr(tokenizer.decode(input_ids[0]))}")
+
+        # generate_ids = text_model.generate(input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask, max_new_tokens=300, do_sample=False, suppress_tokens=None)
+        # generate_ids = text_model.generate(input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask, max_new_tokens=300, do_sample=True, top_k=10, temperature=0.5, suppress_tokens=None)
+        generate_ids = text_model.generate(input_ids, inputs_embeds=input_embeds, attention_mask=attention_mask,
+                                           max_new_tokens=300, do_sample=True,
+                                           suppress_tokens=None)  # Uses the default which is temp=0.6, top_p=0.9
+
+        # Trim off the prompt
+        generate_ids = generate_ids[:, input_ids.shape[1]:]
+        if generate_ids[0][-1] == tokenizer.eos_token_id or generate_ids[0][-1] == tokenizer.convert_tokens_to_ids(
+                "<|eot_id|>"):
+            generate_ids = generate_ids[:, :-1]
+
+        caption = tokenizer.batch_decode(generate_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
+
+        return caption.strip()
+
+    def generate(self, joy_two_pipeline: JoyTwoPipeline, input_dir, output_dir, caption_type, caption_length, low_vram):
+        torch.cuda.empty_cache()
+
+        if joy_two_pipeline.clip_model == None:
+            joy_two_pipeline.parent.loadModels()
+
+        # 'any' means no length specified
+        length = None if caption_length == "any" else caption_length
+
+        if isinstance(length, str):
+            try:
+                length = int(length)
+            except ValueError:
+                pass
+
+        # Build prompt
+        if length is None:
+            map_idx = 0
+        elif isinstance(length, int):
+            map_idx = 1
+        elif isinstance(length, str):
+            map_idx = 2
+        else:
+            raise ValueError(f"Invalid caption length: {length}")
+
+        caption_type_map = joy_config["CAPTION_TYPE_MAP"]
+        prompt_str = list(caption_type_map[caption_type])[map_idx]
+
+        # Add name, length, word_count
+        prompt_str = prompt_str.format(length=caption_length, word_count=caption_length)
+
+        # For debugging
+        print(f"Prompt: {prompt_str}")
+
+        if output_dir is None or output_dir.strip() == "":
+            output_dir = input_dir
+
+        finished_image_count = 0
+        error_image_count = 0
+        image_count = 0
+
+        for filename in os.listdir(input_dir):
+            if filename.lower().endswith((".jpg", ".png", ".jpeg", ".bmp", ".webp")):
+                image_count += 1
+
+        pbar = comfy.utils.ProgressBar(image_count)
+        step = 0
+        for filename in os.listdir(input_dir):
+            if filename.lower().endswith((".jpg", ".png", ".jpeg", ".bmp", ".webp")):
+                image_path = os.path.join(input_dir, filename)
+                text_path = os.path.join(output_dir, os.path.splitext(filename)[0] + '.txt')
+
+                try:
+                    print(f"打开{image_path}")
+                    with Image.open(image_path) as img:
+                        if img.mode == 'RGBA':
+                            img = img.convert('RGB')
+                        pbar.update_absolute(step, image_count)
+                        image = img.resize((384, 384), Image.LANCZOS)
+                        caption = self.generate_caption(joy_two_pipeline, image, prompt_str)
+                        with open(text_path, 'w', encoding='utf-8') as f:
+                            f.write(caption)
+                    finished_image_count += 1
+                except Exception as e:
+                    print(f"Error processing {filename} :{e}")
+                    error_image_count += 1
+                step += 1
+
+
+        # Preprocess image
+        # NOTE: I found the default processor for so400M to have worse results than just using PIL directly
+        # image = clip_processor(images=input_image, return_tensors='pt').pixel_values
+
+        joy_two_pipeline.llm.clear_gpu(low_vram)
+
+        return (f"result: finished count: {finished_image_count}, error count: {error_image_count}", )
+
+class Batch_joy_caption_two_advanced:
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        caption_lengths = list(joy_config["CAPTION_LENGTH"])
+        caption_types = list(joy_config["CAPTION_TYPE_MAP"].keys())
+        return {
+            "required": {
+                "joy_two_pipeline": ("JoyTwoPipeline",),
+                "input_dir": ("STRING", {"default": ""}),
+                "output_dir": ("STRING", {"default": ""}),
+                "rename": ("BOOLEAN", {"default": False}),
+                "prefix_name": ("STRING", {"default": ""}),
+                "start_index": ("INT", {"default": 1, "min": 0, "max": 9999999, "step": 1}),
+                "extra_options": ("Extra_Options", ),
+                "caption_type": (caption_types, {}),
+                "caption_length": (caption_lengths, {"default": "long"}),
+                "name": ("STRING", {"default": ""}),
+                "custom_prompt": ("STRING", {"default": ""}),
+                "low_vram": ("BOOLEAN", {"default": False}),
+                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "temperature": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "prefix_caption": ("STRING", {"default": ""}),
+                "suffix_caption": ("STRING", {"default": ""}),
+            }
+        }
+
+    CATEGORY = "SLK/LLM"
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "generate"
+
+    def generate_caption(self, joy_two_pipeline: JoyTwoPipeline, image, prompt, top_p=0.9, temperature=0.6, low_vram=True):
+        torch.cuda.empty_cache()
+        pixel_values = TVF.pil_to_tensor(image).unsqueeze(0) / 255.0
+        pixel_values = TVF.normalize(pixel_values, [0.5], [0.5])
+        pixel_values = pixel_values.to(joy_two_pipeline.load_device)
+
+        # Embed image
+        # This results in Batch x Image Tokens x Features
+        with torch.amp.autocast_mode.autocast('cuda', enabled=True):
+            vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
+            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
+
+        if low_vram:
+            pixel_values.to(joy_two_pipeline.offload_device)
+            clear_cache()
+
+        # Build the conversation
+        convo = [
+            {
+                "role": "system",
+                "content": "You are a helpful image captioner.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ]
+
+        joy_two_pipeline.loadLLM(joy_two_pipeline.model)
+
+        tokenizer = joy_two_pipeline.llm.tokenizer
+        # Format the conversation
+        convo_string = tokenizer.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
+        assert isinstance(convo_string, str)
+
+        # Tokenize the conversation
+        # prompt_str is tokenized separately so we can do the calculations below
+        convo_tokens = tokenizer.encode(convo_string, return_tensors="pt", add_special_tokens=False, truncation=False)
+        prompt_tokens = tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=False, truncation=False)
+        assert isinstance(convo_tokens, torch.Tensor) and isinstance(prompt_tokens, torch.Tensor)
+        convo_tokens = convo_tokens.squeeze(0)  # Squeeze just to make the following easier
+        prompt_tokens = prompt_tokens.squeeze(0)
+
+        # Calculate where to inject the image
+        eot_id_indices = (convo_tokens == tokenizer.convert_tokens_to_ids("<|eot_id|>")).nonzero(as_tuple=True)[
+            0].tolist()
+        assert len(eot_id_indices) == 2, f"Expected 2 <|eot_id|> tokens, got {len(eot_id_indices)}"
+
+        preamble_len = eot_id_indices[1] - prompt_tokens.shape[0]  # Number of tokens before the prompt
+
+        text_model = joy_two_pipeline.llm.load_llm_model()
+        # Embed the tokens
+        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+        # Construct the input
+        input_embeds = torch.cat([
+            convo_embeds[:, :preamble_len],  # Part before the prompt
+            embedded_images.to(dtype=convo_embeds.dtype),  # Image
+            convo_embeds[:, preamble_len:],  # The prompt and anything after it
+        ], dim=1).to(joy_two_pipeline.load_device)
+
+        input_ids = torch.cat([
+            convo_tokens[:preamble_len].unsqueeze(0),
+            torch.zeros((1, embedded_images.shape[1]), dtype=torch.long),
+            # Dummy tokens for the image (TODO: Should probably use a special token here so as not to confuse any generation algorithms that might be inspecting the input)
+            convo_tokens[preamble_len:].unsqueeze(0),
+        ], dim=1).to(joy_two_pipeline.load_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        # Debugging
+        # print(f"Input to model: {repr(tokenizer.decode(input_ids[0]))}")
+
+        # generate_ids = text_model.generate(input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask, max_new_tokens=300, do_sample=False, suppress_tokens=None)
+        # generate_ids = text_model.generate(input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask, max_new_tokens=300, do_sample=True, top_k=10, temperature=0.5, suppress_tokens=None)
+        generate_ids = text_model.generate(input_ids, inputs_embeds=input_embeds, attention_mask=attention_mask,
+                                           max_new_tokens=300, do_sample=True,
+                                           top_p=top_p, temperature=temperature,
+                                           suppress_tokens=None)  # Uses the default which is temp=0.6, top_p=0.9
+
+        # Trim off the prompt
+        generate_ids = generate_ids[:, input_ids.shape[1]:]
+        if generate_ids[0][-1] == tokenizer.eos_token_id or generate_ids[0][-1] == tokenizer.convert_tokens_to_ids(
+                "<|eot_id|>"):
+            generate_ids = generate_ids[:, :-1]
+
+        caption = tokenizer.batch_decode(generate_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)[0]
+
+        return caption.strip()
+
+    def generate(self, joy_two_pipeline: JoyTwoPipeline, input_dir, output_dir, rename, prefix_name, start_index,
+                 extra_options, caption_type, caption_length, name, custom_prompt, low_vram, top_p, temperature,
+                 prefix_caption, suffix_caption):
+        torch.cuda.empty_cache()
+
+        if joy_two_pipeline.clip_model == None:
+            joy_two_pipeline.parent.loadModels()
+
+        # 'any' means no length specified
+        length = None if caption_length == "any" else caption_length
+
+        if isinstance(length, str):
+            try:
+                length = int(length)
+            except ValueError:
+                pass
+
+        # Build prompt
+        if length is None:
+            map_idx = 0
+        elif isinstance(length, int):
+            map_idx = 1
+        elif isinstance(length, str):
+            map_idx = 2
+        else:
+            raise ValueError(f"Invalid caption length: {length}")
+
+        caption_type_map = joy_config["CAPTION_TYPE_MAP"]
+        prompt_str = list(caption_type_map[caption_type])[map_idx]
+
+        # Add extra options
+        if len(extra_options) > 0:
+            prompt_str += " " + " ".join(extra_options)
+
+        # Add name, length, word_count
+        prompt_str = prompt_str.format(name=name, length=caption_length, word_count=caption_length)
+
+        if custom_prompt.strip() != "":
+            prompt_str = custom_prompt.strip()
+
+        # For debugging
+        print(f"Prompt: {prompt_str}")
+
+        if output_dir is None or output_dir.strip() == "":
+            output_dir = input_dir
+
+        finished_image_count = 0
+        error_image_count = 0
+        image_count = 0
+
+        for filename in os.listdir(input_dir):
+            if filename.lower().endswith((".jpg", ".png", ".jpeg", ".bmp", ".webp")):
+                image_count += 1
+
+        pbar = comfy.utils.ProgressBar(image_count)
+        step = 0
+        for filename in os.listdir(input_dir):
+            if filename.lower().endswith((".jpg", ".png", ".jpeg", ".bmp", ".webp")):
+                image_path = os.path.join(input_dir, filename)
+                text_path = os.path.join(output_dir, os.path.splitext(filename)[0] + '.txt')
+
+                try:
+                    print(f"打开{image_path}")
+                    with Image.open(image_path) as img:
+                        if img.mode == 'RGBA':
+                            image = img.convert('RGB').resize((384, 384), Image.LANCZOS)
+                        else:
+                            image = img.resize((384, 384), Image.LANCZOS)
+                        pbar.update_absolute(step, image_count)
+                        caption = self.generate_caption(joy_two_pipeline, image, prompt_str, top_p, temperature)
+                        if prefix_caption:
+                            caption = f"{prefix_caption} {caption}"
+                        if suffix_caption:
+                            caption = f"{caption} {suffix_caption}"
+                        if rename:
+                            new_filename = f"{prefix_name}_{start_index + finished_image_count}{os.path.splitext(filename)[1]}"
+                            new_image_path = os.path.join(output_dir, new_filename)
+                            shutil.copyfile(image_path, new_image_path)
+                            text_path = os.path.join(output_dir, os.path.splitext(new_filename)[0] + '.txt')
+
+                        with open(text_path, 'w', encoding='utf-8') as f:
+                            f.write(caption)
+                    finished_image_count += 1
+                except Exception as e:
+                    print(f"Error processing {filename} :{e}")
+                    error_image_count += 1
+                step += 1
+
+
+        # Preprocess image
+        # NOTE: I found the default processor for so400M to have worse results than just using PIL directly
+        # image = clip_processor(images=input_image, return_tensors='pt').pixel_values
+
+        joy_two_pipeline.llm.clear_gpu(low_vram)
+
+        return (f"result: finished count: {finished_image_count}, error count: {error_image_count}", )
+
+class Joy_extra_options:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        options = list(joy_config["EXTRA_OPTIONS"])
+        required = {}
+        for option in options:
+            required[option] = ("BOOLEAN", {"default": False})
+        return {
+            "required": required
+        }
+
+    CATEGORY = "SLK/LLM"
+    RETURN_TYPES = ("Extra_Options",)
+    FUNCTION = "run"
+
+    def run(self, **kwargs):
+        # 转为列表
+        options_selected = list(kwargs.values())
+        options = list(joy_config["EXTRA_OPTIONS"])
+        values = []
+        for selected, option in zip(options_selected, options):
+            if selected:
+                values.append(option)
+        return (values, )
+
+================
+File: joy_config.json
+================
+{
+  "CAPTION_TYPE_MAP": {
+    "Descriptive": [
+      "Write a descriptive caption for this image in a formal tone.",
+      "Write a descriptive caption for this image in a formal tone within {word_count} words.",
+      "Write a {length} descriptive caption for this image in a formal tone."
+    ],
+    "Descriptive (Informal)": [
+      "Write a descriptive caption for this image in a casual tone.",
+      "Write a descriptive caption for this image in a casual tone within {word_count} words.",
+      "Write a {length} descriptive caption for this image in a casual tone."
+    ],
+    "Training Prompt": [
+      "Write a stable diffusion prompt for this image.",
+      "Write a stable diffusion prompt for this image within {word_count} words.",
+      "Write a {length} stable diffusion prompt for this image."
+    ],
+    "MidJourney": [
+      "Write a MidJourney prompt for this image.",
+      "Write a MidJourney prompt for this image within {word_count} words.",
+      "Write a {length} MidJourney prompt for this image."
+    ],
+    "Booru tag list": [
+      "Write a list of Booru tags for this image.",
+      "Write a list of Booru tags for this image within {word_count} words.",
+      "Write a {length} list of Booru tags for this image."
+    ],
+    "Booru-like tag list": [
+      "Write a list of Booru-like tags for this image.",
+      "Write a list of Booru-like tags for this image within {word_count} words.",
+      "Write a {length} list of Booru-like tags for this image."
+    ],
+    "Art Critic": [
+      "Analyze this image like an art critic would with information about its composition, style, symbolism, the use of color, light, any artistic movement it might belong to, etc.",
+      "Analyze this image like an art critic would with information about its composition, style, symbolism, the use of color, light, any artistic movement it might belong to, etc. Keep it within {word_count} words.",
+      "Analyze this image like an art critic would with information about its composition, style, symbolism, the use of color, light, any artistic movement it might belong to, etc. Keep it {length}."
+    ],
+    "Product Listing": [
+      "Write a caption for this image as though it were a product listing.",
+      "Write a caption for this image as though it were a product listing. Keep it under {word_count} words.",
+      "Write a {length} caption for this image as though it were a product listing."
+    ],
+    "Social Media Post": [
+      "Write a caption for this image as if it were being used for a social media post.",
+      "Write a caption for this image as if it were being used for a social media post. Limit the caption to {word_count} words.",
+      "Write a {length} caption for this image as if it were being used for a social media post."
+    ]
+  },
+  "CAPTION_LENGTH": [
+    "any",
+    "very short",
+    "short",
+    "medium-length",
+    "long",
+    "very long",
+    "20",
+    "30",
+    "40",
+    "50",
+    "60",
+    "70",
+    "80",
+    "90",
+    "100",
+    "110",
+    "120",
+    "130",
+    "140",
+    "150",
+    "160",
+    "170",
+    "180",
+    "190",
+    "200",
+    "210",
+    "220",
+    "230",
+    "240",
+    "250",
+    "260"
+  ],
+  "EXTRA_OPTIONS": [
+    "If there is a person/character in the image you must refer to them as {name}.",
+	"Do NOT include information about people/characters that cannot be changed (like ethnicity, gender, etc), but do still include changeable attributes (like hair style).",
+	"Include information about lighting.",
+	"Include information about camera angle.",
+	"Include information about whether there is a watermark or not.",
+	"Include information about whether there are JPEG artifacts or not.",
+	"If it is a photo you MUST include information about what camera was likely used and details such as aperture, shutter speed, ISO, etc.",
+	"Do NOT include anything sexual; keep it PG.",
+	"Do NOT mention the image's resolution.",
+	"You MUST include information about the subjective aesthetic quality of the image from low to very high.",
+	"Include information on the image's composition style, such as leading lines, rule of thirds, or symmetry.",
+	"Do NOT mention any text that is in the image.",
+	"Specify the depth of field and whether the background is in focus or blurred.",
+	"If applicable, mention the likely use of artificial or natural lighting sources.",
+	"Do NOT use any ambiguous language.",
+	"Include whether the image is sfw, suggestive, or nsfw.",
+	"ONLY describe the most important elements of the image."
+  ],
+  "model": [
+    "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit",
+    "unsloth/Meta-Llama-3.1-8B-Instruct",
+    "John6666/Llama-3.1-8B-Lexi-Uncensored-V2-nf4",
+    "Orenguteng/Llama-3.1-8B-Lexi-Uncensored-V2"
+  ]
+}
+
+================
+File: joy_config.py
+================
+import os
+from .uitls import read_json_file
+
+joy_base_path = os.path.dirname(os.path.realpath(__file__))
+joy_config = read_json_file(os.path.join(joy_base_path, "joy_config.json"))
+
+================
+File: LICENSE
+================
+GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+                            Preamble
+
+  The GNU General Public License is a free, copyleft license for
+software and other kinds of works.
+
+  The licenses for most software and other practical works are designed
+to take away your freedom to share and change the works.  By contrast,
+the GNU General Public License is intended to guarantee your freedom to
+share and change all versions of a program--to make sure it remains free
+software for all its users.  We, the Free Software Foundation, use the
+GNU General Public License for most of our software; it applies also to
+any other work released this way by its authors.  You can apply it to
+your programs, too.
+
+  When we speak of free software, we are referring to freedom, not
+price.  Our General Public Licenses are designed to make sure that you
+have the freedom to distribute copies of free software (and charge for
+them if you wish), that you receive source code or can get it if you
+want it, that you can change the software or use pieces of it in new
+free programs, and that you know you can do these things.
+
+  To protect your rights, we need to prevent others from denying you
+these rights or asking you to surrender the rights.  Therefore, you have
+certain responsibilities if you distribute copies of the software, or if
+you modify it: responsibilities to respect the freedom of others.
+
+  For example, if you distribute copies of such a program, whether
+gratis or for a fee, you must pass on to the recipients the same
+freedoms that you received.  You must make sure that they, too, receive
+or can get the source code.  And you must show them these terms so they
+know their rights.
+
+  Developers that use the GNU GPL protect your rights with two steps:
+(1) assert copyright on the software, and (2) offer you this License
+giving you legal permission to copy, distribute and/or modify it.
+
+  For the developers' and authors' protection, the GPL clearly explains
+that there is no warranty for this free software.  For both users' and
+authors' sake, the GPL requires that modified versions be marked as
+changed, so that their problems will not be attributed erroneously to
+authors of previous versions.
+
+  Some devices are designed to deny users access to install or run
+modified versions of the software inside them, although the manufacturer
+can do so.  This is fundamentally incompatible with the aim of
+protecting users' freedom to change the software.  The systematic
+pattern of such abuse occurs in the area of products for individuals to
+use, which is precisely where it is most unacceptable.  Therefore, we
+have designed this version of the GPL to prohibit the practice for those
+products.  If such problems arise substantially in other domains, we
+stand ready to extend this provision to those domains in future versions
+of the GPL, as needed to protect the freedom of users.
+
+  Finally, every program is threatened constantly by software patents.
+States should not allow patents to restrict development and use of
+software on general-purpose computers, but in those that do, we wish to
+avoid the special danger that patents applied to a free program could
+make it effectively proprietary.  To prevent this, the GPL assures that
+patents cannot be used to render the program non-free.
+
+  The precise terms and conditions for copying, distribution and
+modification follow.
+
+                       TERMS AND CONDITIONS
+
+  0. Definitions.
+
+  "This License" refers to version 3 of the GNU General Public License.
+
+  "Copyright" also means copyright-like laws that apply to other kinds of
+works, such as semiconductor masks.
+
+  "The Program" refers to any copyrightable work licensed under this
+License.  Each licensee is addressed as "you".  "Licensees" and
+"recipients" may be individuals or organizations.
+
+  To "modify" a work means to copy from or adapt all or part of the work
+in a fashion requiring copyright permission, other than the making of an
+exact copy.  The resulting work is called a "modified version" of the
+earlier work or a work "based on" the earlier work.
+
+  A "covered work" means either the unmodified Program or a work based
+on the Program.
+
+  To "propagate" a work means to do anything with it that, without
+permission, would make you directly or secondarily liable for
+infringement under applicable copyright law, except executing it on a
+computer or modifying a private copy.  Propagation includes copying,
+distribution (with or without modification), making available to the
+public, and in some countries other activities as well.
+
+  To "convey" a work means any kind of propagation that enables other
+parties to make or receive copies.  Mere interaction with a user through
+a computer network, with no transfer of a copy, is not conveying.
+
+  An interactive user interface displays "Appropriate Legal Notices"
+to the extent that it includes a convenient and prominently visible
+feature that (1) displays an appropriate copyright notice, and (2)
+tells the user that there is no warranty for the work (except to the
+extent that warranties are provided), that licensees may convey the
+work under this License, and how to view a copy of this License.  If
+the interface presents a list of user commands or options, such as a
+menu, a prominent item in the list meets this criterion.
+
+  1. Source Code.
+
+  The "source code" for a work means the preferred form of the work
+for making modifications to it.  "Object code" means any non-source
+form of a work.
+
+  A "Standard Interface" means an interface that either is an official
+standard defined by a recognized standards body, or, in the case of
+interfaces specified for a particular programming language, one that
+is widely used among developers working in that language.
+
+  The "System Libraries" of an executable work include anything, other
+than the work as a whole, that (a) is included in the normal form of
+packaging a Major Component, but which is not part of that Major
+Component, and (b) serves only to enable use of the work with that
+Major Component, or to implement a Standard Interface for which an
+implementation is available to the public in source code form.  A
+"Major Component", in this context, means a major essential component
+(kernel, window system, and so on) of the specific operating system
+(if any) on which the executable work runs, or a compiler used to
+produce the work, or an object code interpreter used to run it.
+
+  The "Corresponding Source" for a work in object code form means all
+the source code needed to generate, install, and (for an executable
+work) run the object code and to modify the work, including scripts to
+control those activities.  However, it does not include the work's
+System Libraries, or general-purpose tools or generally available free
+programs which are used unmodified in performing those activities but
+which are not part of the work.  For example, Corresponding Source
+includes interface definition files associated with source files for
+the work, and the source code for shared libraries and dynamically
+linked subprograms that the work is specifically designed to require,
+such as by intimate data communication or control flow between those
+subprograms and other parts of the work.
+
+  The Corresponding Source need not include anything that users
+can regenerate automatically from other parts of the Corresponding
+Source.
+
+  The Corresponding Source for a work in source code form is that
+same work.
+
+  2. Basic Permissions.
+
+  All rights granted under this License are granted for the term of
+copyright on the Program, and are irrevocable provided the stated
+conditions are met.  This License explicitly affirms your unlimited
+permission to run the unmodified Program.  The output from running a
+covered work is covered by this License only if the output, given its
+content, constitutes a covered work.  This License acknowledges your
+rights of fair use or other equivalent, as provided by copyright law.
+
+  You may make, run and propagate covered works that you do not
+convey, without conditions so long as your license otherwise remains
+in force.  You may convey covered works to others for the sole purpose
+of having them make modifications exclusively for you, or provide you
+with facilities for running those works, provided that you comply with
+the terms of this License in conveying all material for which you do
+not control copyright.  Those thus making or running the covered works
+for you must do so exclusively on your behalf, under your direction
+and control, on terms that prohibit them from making any copies of
+your copyrighted material outside their relationship with you.
+
+  Conveying under any other circumstances is permitted solely under
+the conditions stated below.  Sublicensing is not allowed; section 10
+makes it unnecessary.
+
+  3. Protecting Users' Legal Rights From Anti-Circumvention Law.
+
+  No covered work shall be deemed part of an effective technological
+measure under any applicable law fulfilling obligations under article
+11 of the WIPO copyright treaty adopted on 20 December 1996, or
+similar laws prohibiting or restricting circumvention of such
+measures.
+
+  When you convey a covered work, you waive any legal power to forbid
+circumvention of technological measures to the extent such circumvention
+is effected by exercising rights under this License with respect to
+the covered work, and you disclaim any intention to limit operation or
+modification of the work as a means of enforcing, against the work's
+users, your or third parties' legal rights to forbid circumvention of
+technological measures.
+
+  4. Conveying Verbatim Copies.
+
+  You may convey verbatim copies of the Program's source code as you
+receive it, in any medium, provided that you conspicuously and
+appropriately publish on each copy an appropriate copyright notice;
+keep intact all notices stating that this License and any
+non-permissive terms added in accord with section 7 apply to the code;
+keep intact all notices of the absence of any warranty; and give all
+recipients a copy of this License along with the Program.
+
+  You may charge any price or no price for each copy that you convey,
+and you may offer support or warranty protection for a fee.
+
+  5. Conveying Modified Source Versions.
+
+  You may convey a work based on the Program, or the modifications to
+produce it from the Program, in the form of source code under the
+terms of section 4, provided that you also meet all of these conditions:
+
+    a) The work must carry prominent notices stating that you modified
+    it, and giving a relevant date.
+
+    b) The work must carry prominent notices stating that it is
+    released under this License and any conditions added under section
+    7.  This requirement modifies the requirement in section 4 to
+    "keep intact all notices".
+
+    c) You must license the entire work, as a whole, under this
+    License to anyone who comes into possession of a copy.  This
+    License will therefore apply, along with any applicable section 7
+    additional terms, to the whole of the work, and all its parts,
+    regardless of how they are packaged.  This License gives no
+    permission to license the work in any other way, but it does not
+    invalidate such permission if you have separately received it.
+
+    d) If the work has interactive user interfaces, each must display
+    Appropriate Legal Notices; however, if the Program has interactive
+    interfaces that do not display Appropriate Legal Notices, your
+    work need not make them do so.
+
+  A compilation of a covered work with other separate and independent
+works, which are not by their nature extensions of the covered work,
+and which are not combined with it such as to form a larger program,
+in or on a volume of a storage or distribution medium, is called an
+"aggregate" if the compilation and its resulting copyright are not
+used to limit the access or legal rights of the compilation's users
+beyond what the individual works permit.  Inclusion of a covered work
+in an aggregate does not cause this License to apply to the other
+parts of the aggregate.
+
+  6. Conveying Non-Source Forms.
+
+  You may convey a covered work in object code form under the terms
+of sections 4 and 5, provided that you also convey the
+machine-readable Corresponding Source under the terms of this License,
+in one of these ways:
+
+    a) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by the
+    Corresponding Source fixed on a durable physical medium
+    customarily used for software interchange.
+
+    b) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by a
+    written offer, valid for at least three years and valid for as
+    long as you offer spare parts or customer support for that product
+    model, to give anyone who possesses the object code either (1) a
+    copy of the Corresponding Source for all the software in the
+    product that is covered by this License, on a durable physical
+    medium customarily used for software interchange, for a price no
+    more than your reasonable cost of physically performing this
+    conveying of source, or (2) access to copy the
+    Corresponding Source from a network server at no charge.
+
+    c) Convey individual copies of the object code with a copy of the
+    written offer to provide the Corresponding Source.  This
+    alternative is allowed only occasionally and noncommercially, and
+    only if you received the object code with such an offer, in accord
+    with subsection 6b.
+
+    d) Convey the object code by offering access from a designated
+    place (gratis or for a charge), and offer equivalent access to the
+    Corresponding Source in the same way through the same place at no
+    further charge.  You need not require recipients to copy the
+    Corresponding Source along with the object code.  If the place to
+    copy the object code is a network server, the Corresponding Source
+    may be on a different server (operated by you or a third party)
+    that supports equivalent copying facilities, provided you maintain
+    clear directions next to the object code saying where to find the
+    Corresponding Source.  Regardless of what server hosts the
+    Corresponding Source, you remain obligated to ensure that it is
+    available for as long as needed to satisfy these requirements.
+
+    e) Convey the object code using peer-to-peer transmission, provided
+    you inform other peers where the object code and Corresponding
+    Source of the work are being offered to the general public at no
+    charge under subsection 6d.
+
+  A separable portion of the object code, whose source code is excluded
+from the Corresponding Source as a System Library, need not be
+included in conveying the object code work.
+
+  A "User Product" is either (1) a "consumer product", which means any
+tangible personal property which is normally used for personal, family,
+or household purposes, or (2) anything designed or sold for incorporation
+into a dwelling.  In determining whether a product is a consumer product,
+doubtful cases shall be resolved in favor of coverage.  For a particular
+product received by a particular user, "normally used" refers to a
+typical or common use of that class of product, regardless of the status
+of the particular user or of the way in which the particular user
+actually uses, or expects or is expected to use, the product.  A product
+is a consumer product regardless of whether the product has substantial
+commercial, industrial or non-consumer uses, unless such uses represent
+the only significant mode of use of the product.
+
+  "Installation Information" for a User Product means any methods,
+procedures, authorization keys, or other information required to install
+and execute modified versions of a covered work in that User Product from
+a modified version of its Corresponding Source.  The information must
+suffice to ensure that the continued functioning of the modified object
+code is in no case prevented or interfered with solely because
+modification has been made.
+
+  If you convey an object code work under this section in, or with, or
+specifically for use in, a User Product, and the conveying occurs as
+part of a transaction in which the right of possession and use of the
+User Product is transferred to the recipient in perpetuity or for a
+fixed term (regardless of how the transaction is characterized), the
+Corresponding Source conveyed under this section must be accompanied
+by the Installation Information.  But this requirement does not apply
+if neither you nor any third party retains the ability to install
+modified object code on the User Product (for example, the work has
+been installed in ROM).
+
+  The requirement to provide Installation Information does not include a
+requirement to continue to provide support service, warranty, or updates
+for a work that has been modified or installed by the recipient, or for
+the User Product in which it has been modified or installed.  Access to a
+network may be denied when the modification itself materially and
+adversely affects the operation of the network or violates the rules and
+protocols for communication across the network.
+
+  Corresponding Source conveyed, and Installation Information provided,
+in accord with this section must be in a format that is publicly
+documented (and with an implementation available to the public in
+source code form), and must require no special password or key for
+unpacking, reading or copying.
+
+  7. Additional Terms.
+
+  "Additional permissions" are terms that supplement the terms of this
+License by making exceptions from one or more of its conditions.
+Additional permissions that are applicable to the entire Program shall
+be treated as though they were included in this License, to the extent
+that they are valid under applicable law.  If additional permissions
+apply only to part of the Program, that part may be used separately
+under those permissions, but the entire Program remains governed by
+this License without regard to the additional permissions.
+
+  When you convey a copy of a covered work, you may at your option
+remove any additional permissions from that copy, or from any part of
+it.  (Additional permissions may be written to require their own
+removal in certain cases when you modify the work.)  You may place
+additional permissions on material, added by you to a covered work,
+for which you have or can give appropriate copyright permission.
+
+  Notwithstanding any other provision of this License, for material you
+add to a covered work, you may (if authorized by the copyright holders of
+that material) supplement the terms of this License with terms:
+
+    a) Disclaiming warranty or limiting liability differently from the
+    terms of sections 15 and 16 of this License; or
+
+    b) Requiring preservation of specified reasonable legal notices or
+    author attributions in that material or in the Appropriate Legal
+    Notices displayed by works containing it; or
+
+    c) Prohibiting misrepresentation of the origin of that material, or
+    requiring that modified versions of such material be marked in
+    reasonable ways as different from the original version; or
+
+    d) Limiting the use for publicity purposes of names of licensors or
+    authors of the material; or
+
+    e) Declining to grant rights under trademark law for use of some
+    trade names, trademarks, or service marks; or
+
+    f) Requiring indemnification of licensors and authors of that
+    material by anyone who conveys the material (or modified versions of
+    it) with contractual assumptions of liability to the recipient, for
+    any liability that these contractual assumptions directly impose on
+    those licensors and authors.
+
+  All other non-permissive additional terms are considered "further
+restrictions" within the meaning of section 10.  If the Program as you
+received it, or any part of it, contains a notice stating that it is
+governed by this License along with a term that is a further
+restriction, you may remove that term.  If a license document contains
+a further restriction but permits relicensing or conveying under this
+License, you may add to a covered work material governed by the terms
+of that license document, provided that the further restriction does
+not survive such relicensing or conveying.
+
+  If you add terms to a covered work in accord with this section, you
+must place, in the relevant source files, a statement of the
+additional terms that apply to those files, or a notice indicating
+where to find the applicable terms.
+
+  Additional terms, permissive or non-permissive, may be stated in the
+form of a separately written license, or stated as exceptions;
+the above requirements apply either way.
+
+  8. Termination.
+
+  You may not propagate or modify a covered work except as expressly
+provided under this License.  Any attempt otherwise to propagate or
+modify it is void, and will automatically terminate your rights under
+this License (including any patent licenses granted under the third
+paragraph of section 11).
+
+  However, if you cease all violation of this License, then your
+license from a particular copyright holder is reinstated (a)
+provisionally, unless and until the copyright holder explicitly and
+finally terminates your license, and (b) permanently, if the copyright
+holder fails to notify you of the violation by some reasonable means
+prior to 60 days after the cessation.
+
+  Moreover, your license from a particular copyright holder is
+reinstated permanently if the copyright holder notifies you of the
+violation by some reasonable means, this is the first time you have
+received notice of violation of this License (for any work) from that
+copyright holder, and you cure the violation prior to 30 days after
+your receipt of the notice.
+
+  Termination of your rights under this section does not terminate the
+licenses of parties who have received copies or rights from you under
+this License.  If your rights have been terminated and not permanently
+reinstated, you do not qualify to receive new licenses for the same
+material under section 10.
+
+  9. Acceptance Not Required for Having Copies.
+
+  You are not required to accept this License in order to receive or
+run a copy of the Program.  Ancillary propagation of a covered work
+occurring solely as a consequence of using peer-to-peer transmission
+to receive a copy likewise does not require acceptance.  However,
+nothing other than this License grants you permission to propagate or
+modify any covered work.  These actions infringe copyright if you do
+not accept this License.  Therefore, by modifying or propagating a
+covered work, you indicate your acceptance of this License to do so.
+
+  10. Automatic Licensing of Downstream Recipients.
+
+  Each time you convey a covered work, the recipient automatically
+receives a license from the original licensors, to run, modify and
+propagate that work, subject to this License.  You are not responsible
+for enforcing compliance by third parties with this License.
+
+  An "entity transaction" is a transaction transferring control of an
+organization, or substantially all assets of one, or subdividing an
+organization, or merging organizations.  If propagation of a covered
+work results from an entity transaction, each party to that
+transaction who receives a copy of the work also receives whatever
+licenses to the work the party's predecessor in interest had or could
+give under the previous paragraph, plus a right to possession of the
+Corresponding Source of the work from the predecessor in interest, if
+the predecessor has it or can get it with reasonable efforts.
+
+  You may not impose any further restrictions on the exercise of the
+rights granted or affirmed under this License.  For example, you may
+not impose a license fee, royalty, or other charge for exercise of
+rights granted under this License, and you may not initiate litigation
+(including a cross-claim or counterclaim in a lawsuit) alleging that
+any patent claim is infringed by making, using, selling, offering for
+sale, or importing the Program or any portion of it.
+
+  11. Patents.
+
+  A "contributor" is a copyright holder who authorizes use under this
+License of the Program or a work on which the Program is based.  The
+work thus licensed is called the contributor's "contributor version".
+
+  A contributor's "essential patent claims" are all patent claims
+owned or controlled by the contributor, whether already acquired or
+hereafter acquired, that would be infringed by some manner, permitted
+by this License, of making, using, or selling its contributor version,
+but do not include claims that would be infringed only as a
+consequence of further modification of the contributor version.  For
+purposes of this definition, "control" includes the right to grant
+patent sublicenses in a manner consistent with the requirements of
+this License.
+
+  Each contributor grants you a non-exclusive, worldwide, royalty-free
+patent license under the contributor's essential patent claims, to
+make, use, sell, offer for sale, import and otherwise run, modify and
+propagate the contents of its contributor version.
+
+  In the following three paragraphs, a "patent license" is any express
+agreement or commitment, however denominated, not to enforce a patent
+(such as an express permission to practice a patent or covenant not to
+sue for patent infringement).  To "grant" such a patent license to a
+party means to make such an agreement or commitment not to enforce a
+patent against the party.
+
+  If you convey a covered work, knowingly relying on a patent license,
+and the Corresponding Source of the work is not available for anyone
+to copy, free of charge and under the terms of this License, through a
+publicly available network server or other readily accessible means,
+then you must either (1) cause the Corresponding Source to be so
+available, or (2) arrange to deprive yourself of the benefit of the
+patent license for this particular work, or (3) arrange, in a manner
+consistent with the requirements of this License, to extend the patent
+license to downstream recipients.  "Knowingly relying" means you have
+actual knowledge that, but for the patent license, your conveying the
+covered work in a country, or your recipient's use of the covered work
+in a country, would infringe one or more identifiable patents in that
+country that you have reason to believe are valid.
+
+  If, pursuant to or in connection with a single transaction or
+arrangement, you convey, or propagate by procuring conveyance of, a
+covered work, and grant a patent license to some of the parties
+receiving the covered work authorizing them to use, propagate, modify
+or convey a specific copy of the covered work, then the patent license
+you grant is automatically extended to all recipients of the covered
+work and works based on it.
+
+  A patent license is "discriminatory" if it does not include within
+the scope of its coverage, prohibits the exercise of, or is
+conditioned on the non-exercise of one or more of the rights that are
+specifically granted under this License.  You may not convey a covered
+work if you are a party to an arrangement with a third party that is
+in the business of distributing software, under which you make payment
+to the third party based on the extent of your activity of conveying
+the work, and under which the third party grants, to any of the
+parties who would receive the covered work from you, a discriminatory
+patent license (a) in connection with copies of the covered work
+conveyed by you (or copies made from those copies), or (b) primarily
+for and in connection with specific products or compilations that
+contain the covered work, unless you entered into that arrangement,
+or that patent license was granted, prior to 28 March 2007.
+
+  Nothing in this License shall be construed as excluding or limiting
+any implied license or other defenses to infringement that may
+otherwise be available to you under applicable patent law.
+
+  12. No Surrender of Others' Freedom.
+
+  If conditions are imposed on you (whether by court order, agreement or
+otherwise) that contradict the conditions of this License, they do not
+excuse you from the conditions of this License.  If you cannot convey a
+covered work so as to satisfy simultaneously your obligations under this
+License and any other pertinent obligations, then as a consequence you may
+not convey it at all.  For example, if you agree to terms that obligate you
+to collect a royalty for further conveying from those to whom you convey
+the Program, the only way you could satisfy both those terms and this
+License would be to refrain entirely from conveying the Program.
+
+  13. Use with the GNU Affero General Public License.
+
+  Notwithstanding any other provision of this License, you have
+permission to link or combine any covered work with a work licensed
+under version 3 of the GNU Affero General Public License into a single
+combined work, and to convey the resulting work.  The terms of this
+License will continue to apply to the part which is the covered work,
+but the special requirements of the GNU Affero General Public License,
+section 13, concerning interaction through a network will apply to the
+combination as such.
+
+  14. Revised Versions of this License.
+
+  The Free Software Foundation may publish revised and/or new versions of
+the GNU General Public License from time to time.  Such new versions will
+be similar in spirit to the present version, but may differ in detail to
+address new problems or concerns.
+
+  Each version is given a distinguishing version number.  If the
+Program specifies that a certain numbered version of the GNU General
+Public License "or any later version" applies to it, you have the
+option of following the terms and conditions either of that numbered
+version or of any later version published by the Free Software
+Foundation.  If the Program does not specify a version number of the
+GNU General Public License, you may choose any version ever published
+by the Free Software Foundation.
+
+  If the Program specifies that a proxy can decide which future
+versions of the GNU General Public License can be used, that proxy's
+public statement of acceptance of a version permanently authorizes you
+to choose that version for the Program.
+
+  Later license versions may give you additional or different
+permissions.  However, no additional obligations are imposed on any
+author or copyright holder as a result of your choosing to follow a
+later version.
+
+  15. Disclaimer of Warranty.
+
+  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
+APPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
+HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
+OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM
+IS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF
+ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
+
+  16. Limitation of Liability.
+
+  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
+THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
+GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF
+DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD
+PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),
+EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES.
+
+  17. Interpretation of Sections 15 and 16.
+
+  If the disclaimer of warranty and limitation of liability provided
+above cannot be given local legal effect according to their terms,
+reviewing courts shall apply local law that most closely approximates
+an absolute waiver of all civil liability in connection with the
+Program, unless a warranty or assumption of liability accompanies a
+copy of the Program in return for a fee.
+
+                     END OF TERMS AND CONDITIONS
+
+            How to Apply These Terms to Your New Programs
+
+  If you develop a new program, and you want it to be of the greatest
+possible use to the public, the best way to achieve this is to make it
+free software which everyone can redistribute and change under these terms.
+
+  To do so, attach the following notices to the program.  It is safest
+to attach them to the start of each source file to most effectively
+state the exclusion of warranty; and each file should have at least
+the "copyright" line and a pointer to where the full notice is found.
+
+    <one line to give the program's name and a brief idea of what it does.>
+    Copyright (C) <year>  <name of author>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Also add information on how to contact you by electronic and paper mail.
+
+  If the program does terminal interaction, make it output a short
+notice like this when it starts in an interactive mode:
+
+    <program>  Copyright (C) <year>  <name of author>
+    This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.
+    This is free software, and you are welcome to redistribute it
+    under certain conditions; type `show c' for details.
+
+The hypothetical commands `show w' and `show c' should show the appropriate
+parts of the General Public License.  Of course, your program's commands
+might be different; for a GUI interface, you would use an "about box".
+
+  You should also get your employer (if you work as a programmer) or school,
+if any, to sign a "copyright disclaimer" for the program, if necessary.
+For more information on this, and how to apply and follow the GNU GPL, see
+<https://www.gnu.org/licenses/>.
+
+  The GNU General Public License does not permit incorporating your program
+into proprietary programs.  If your program is a subroutine library, you
+may consider it more useful to permit linking proprietary applications with
+the library.  If this is what you want to do, use the GNU Lesser General
+Public License instead of this License.  But first, please read
+<https://www.gnu.org/licenses/why-not-lgpl.html>.
+
+================
+File: pyproject.toml
+================
+[project]
+name = "comfyui_slk_joy_caption_two"
+description = "NODES:Joy Caption Two, Joy Caption Two Advanced, Joy Caption Two Load, Joy Caption Extra Options"
+version = "0.0.8"
+license = {file = "LICENSE"}
+dependencies = ["huggingface_hub==0.23.4", "transformers>=4.44.0", "numpy", "sentencepiece", "pillow>=10.1.0", "bitsandbytes>=0.44.1", "peft==0.12.0"]
+
+[project.urls]
+Repository = "https://github.com/EvilBT/ComfyUI_SLK_joy_caption_two"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "sherlockbt"
+DisplayName = "ComfyUI_SLK_joy_caption_two"
+Icon = ""
+
+================
+File: readme_us.md
+================
+# JoyCaptionAlpha Two for ComfyUI
+English | [中文](./readme.md)
+
+Huge thanks to the original Joy Caption author, fpgaminer, whose work is available at: https://github.com/fpgaminer/joycaption. We deeply appreciate their contribution to open source!
+
+## Recent changes
+* [2024-10-22] v0.0.8: Advanced batch captioning with prefix and suffix, convenient for batch adding trigger words during training.
+* [2024-10-16] v0.0.7: Unified model loading precision, fixed the bug where the model could not be switched the second time, and added a rename switch to advanced batch captioning.
+* [2024-10-16] v0.0.6: Added `top_p` and `temperature` parameters to the advanced mode for greater control. Expanded the selection of large language models. I tested [John6666/Llama-3.1-8B-Lexi-Uncensored-V2-nf4](https://huggingface.co/John6666/Llama-3.1-8B-Lexi-Uncensored-V2-nf4) and found the results quite good; you can also try it out. Additionally, the original [Orenguteng/Llama-3.1-8B-Lexi-Uncensored-V2](https://huggingface.co/Orenguteng/Llama-3.1-8B-Lexi-Uncensored-V2) model has been added as an option.
+* [2024-10-15] v0.0.5: Fix the bug when processing images with an alpha channel (RGBA) in batch.
+* [2024-10-15] v0.0.4: Added batch processing nodes: When the output directory is empty, it will be saved in the image folder.  You can find the example workflow in the examples directory.
+* [2024-10-15] v0.0.3: Fixed an issue where specifying 'cuda:0' would partially fail, now defaults to 'cuda'
+* [2024-10-14] v0.0.2: Added registration to Comfy Manager, allowing for installation of this node through it. Fixed the incorrect model selection guidance; the original framework was based on unsloth/Meta-Llama-3.1-8B-Instruct instead of Meta-Llama-3.1-8B.
+* [2024-10-12] v0.0.1: Basic implementation of [JoyCaptionAlpha Two](https://huggingface.co/spaces/fancyfeast/joy-caption-alpha-two) on ComfyUI is completed.
+
+
+## Implementation of JoyCaptionAlpha Two on ComfyUI
+
+Referred to [Comfyui_CXH_joy_caption](https://github.com/StartHua/Comfyui_CXH_joy_caption) and [JoyCaptionAlpha Two](https://huggingface.co/spaces/fancyfeast/joy-caption-alpha-two).
+
+Refer to the example workflow in examples/workflows.png:
+![image](./examples/workflows.png)
+
+### Installation
+
+You can install the node using Comfy Manager. Search for "JoyCaptionAlpha Two for ComfyUI" and install it.
+
+Alternatively, you can install it manually using the following steps. Please also refer to the "Downloading Related Models" section below, especially for the Joy-Caption-alpha-two model, which must be downloaded manually.
+
+### Dependency Installation
+
+1. Download and clone the repository to the custom_nodes subfolder.
+```
+cd custom_nodes
+git clone https://github.com/EvilBT/ComfyUI_SLK_joy_caption_two.git
+```
+2. Install related dependencies:
+```
+pip install -r ComfyUI_SLK_joy_caption_two\requirements.txt
+```
+3. Download related models.
+4. Restart ComfyUI.
+
+### Downloading Related Models
+The following "models" directory refers to the models folder under the ComfyUI root directory.
+
+#### 1. google/siglip-so400m-patch14-384:
+
+International: [google/siglip-so400m-patch14-384](https://huggingface.co/google/siglip-so400m-patch14-384)
+
+China: [hf/google/siglip-so400m-patch14-384](https://hf-mirror.com/google/siglip-so400m-patch14-384)
+
+It will be downloaded automatically. You can also manually download the entire repository and copy all files inside siglip-so400m-patch14-384 to `models/clip/siglip-so400m-patch14-384`.
+![image](./examples/clip.png)
+
+#### 2. Llama 3.1-8B-Instruct Model Download
+
+Two versions are supported:
+
+* **unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit:** This version utilizes 4-bit quantization (bnb) and is ideal for users with limited VRAM. This is the version I personally use and recommend, especially for 8GB VRAM environments. 
+
+* **unsloth/Meta-Llama-3.1-8B-Instruct:** This is the standard, unquantized version of the model. I have not tested it extensively, but you are welcome to try it out.
+
+Both versions will be downloaded automatically by the program if they are not found, but you can also download them manually from the links below:
+
+**2.1 unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit**
+
+* **International:** [unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit](https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit)
+* **China:** [hf/unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit](https://hf-mirror.com/unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit)
+
+After downloading, copy the entire contents of the folder to `models\LLM\Meta-Llama-3.1-8B-Instruct-bnb-4bit`.
+
+**2.2 unsloth/Meta-Llama-3.1-8B-Instruct**
+
+* **International:** [unsloth/Meta-Llama-3.1-8B-Instruct](https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct)
+* **China:** [hf/unsloth/Meta-Llama-3.1-8B-Instruct](https://hf-mirror.com/unsloth/Meta-Llama-3.1-8B-Instruct)
+
+After downloading, copy the entire contents of the folder to `models\LLM\Meta-Llama-3.1-8B-Instruct`.
+
+![image](./examples/Llama3.1-8b.png)
+
+#### 3. Joy-Caption-alpha-two Model Download (must be downloaded manually)
+
+Download and copy all the contents of the `cgrkzexw-599808` folder under [Joy-Caption-alpha-two](https://huggingface.co/spaces/fancyfeast/joy-caption-alpha-two/tree/main) to `models/Joy_caption_two`.
+![image](./examples/joy_caption.png)
+
+### After restarting ComfyUI, you can add and use it. Refer to the following images for details:
+![image](./examples/workflows.png)
+
+### Others
+
+If you have installed the [AIGODLIKE-ComfyUI-Translation](https://github.com/AIGODLIKE/AIGODLIKE-ComfyUI-Translation) language pack plugin, you can copy the Chinese translation under the `translation` folder to the corresponding language pack path, and restart to use the Chinese version.
+Copy `translation/zh-CN/Nodes/Comfyui_SLK_joy_caption_two.json` to the directory: `AIGODLIKE-ComfyUI-Translation\zh-CN\Nodes`.
+
+You can open an issue to ask me if you have any questions. It has not been fully tested, I am using an 8G VRAM environment.
+
+================
+File: readme.md
+================
+# JoyCaptionAlpha Two for ComfyUI
+[English](./readme_us.md) | 中文
+
+Joy Caption 原作者在这：https://github.com/fpgaminer/joycaption ，非常感谢他的开源！
+
+## Recent changes
+* [2024-10-22] v0.0.8: 高级批量增加前缀字幕,后缀字幕，方便训练时批量添加触发词。
+* [2024-10-16] v0.0.7: 统一模型加载精度，修复模型第二次无法切换的BUG，高级批量字幕增加重命名开关。
+* [2024-10-16] v0.0.6: 高级模式增加top_p与temperature，给予更多的选择，添加更多的大模型选择，我试了一下 [John6666/Llama-3.1-8B-Lexi-Uncensored-V2-nf4](https://huggingface.co/John6666/Llama-3.1-8B-Lexi-Uncensored-V2-nf4)
+效果不错，你们也可以尝试使用，另外也添加了原版的模型 [Orenguteng/Llama-3.1-8B-Lexi-Uncensored-V2](https://huggingface.co/Orenguteng/Llama-3.1-8B-Lexi-Uncensored-V2)，可以自行选择
+* [2024-10-15] v0.0.5: 修复批处理时图片有透明通道 RGBA 时的BUG
+* [2024-10-15] v0.0.4: 添加指量处理节点：字幕保存目录为空时则保存在图片文件夹下，参考工作流可以在examples目录下查看。
+* [2024-10-15] v0.0.3: 修复'cuda:0'部分出错的问题，直接设置为 'cuda'
+* [2024-10-14] v0.0.2: 添加注册到Comfy Manager, 可以通过它来安装该节点。修复错误的模型选择引导，原框架是基于 `unsloth/Meta-Llama-3.1-8B-Instruct` 而不是 `Meta-Llama-3.1-8B`
+* [2024-10-12] v0.0.1: 基本完成[JoyCaptionAlpha Two](https://huggingface.co/spaces/fancyfeast/joy-caption-alpha-two)到ComfyUI的实现
+
+
+## ComfyUI上JoyCaptionAlpha Two的实现
+
+参考自 [Comfyui_CXH_joy_caption](https://github.com/StartHua/Comfyui_CXH_joy_caption), 以及 [JoyCaptionAlpha Two](https://huggingface.co/spaces/fancyfeast/joy-caption-alpha-two)
+
+参考工作流在examples/workflows.png中获取:
+![image](./examples/workflows.png)
+
+### 安装
+
+使用 Comfy Manager, 节点安装搜索：`JoyCaptionAlpha Two for ComfyUI` 安装即可，或者使用下面手动安装方式也可以，另外注意查看下面的相关模型下载，特别是Joy-Caption-alpha-two 模型下载（必须手动下载）
+
+### 依赖安装
+
+1. 把仓库下载克隆到 custom_nodes 子文件夹下。
+```
+cd custom_nodes
+git clone https://github.com/EvilBT/ComfyUI_SLK_joy_caption_two.git
+```
+2. 安装相关依赖：
+```angular2html
+pip install -r ComfyUI_SLK_joy_caption_two\requirements.txt
+```
+ 
+- 2.1 一定要确保相关依赖的版本都不小于requirements.txt的版本要求
+
+3. 下载相关模型。
+
+- 3.1 最好都是手动下载到指定目录，一定要注意路径要对得上，可以参考下面的截图
+
+4. 重启ComfyUI。
+
+### 相关模型下载
+以下的models目录是指ComfyUI根目录下的models文件夹
+#### 1. google/siglip-so400m-patch14-384:
+
+国外：[google/siglip-so400m-patch14-384](https://huggingface.co/google/siglip-so400m-patch14-384)
+
+国内：[hf/google/siglip-so400m-patch14-384](https://hf-mirror.com/google/siglip-so400m-patch14-384)
+
+会自动下载，也可以手动下载整个仓库，并把siglip-so400m-patch14-384内的文件全部复制到`models/clip/siglip-so400m-patch14-384`
+![image](./examples/clip.png)
+#### 2. Llama3.1-8B-Instruct 模型下载
+
+支持两个版本：bnb-4bit是小显存的福音，我是使用这个版本的，原版的我没有测试过，可自行测试。程序会自动下载，可自行下载。
+
+2.1 unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit
+
+国外：[unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit](https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit)
+
+国内：[hf/unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit](https://hf-mirror.com/unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit)
+
+把整个文件夹内的内容复制到 `models\LLM\Meta-Llama-3.1-8B-Instruct-bnb-4bit` 下
+
+2.2 unsloth/Meta-Llama-3.1-8B-Instruct
+
+国外：[unsloth/Meta-Llama-3.1-8B-Instruct](https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct)
+
+国内：[hf/unsloth/Meta-Llama-3.1-8B-Instruct](https://hf-mirror.com/unsloth/Meta-Llama-3.1-8B-Instruct)
+
+把下载后的整个文件夹的内容复制到`models\LLM\Meta-Llama-3.1-8B-Instruct`下
+![image](./examples/Llama3.1-8b.png)
+
+#### 3. Joy-Caption-alpha-two 模型下载（必须手动下载）
+
+把 [Joy-Caption-alpha-two](https://huggingface.co/spaces/fancyfeast/joy-caption-alpha-two/tree/main) 下的`cgrkzexw-599808`
+文件夹的所有内容下载复制到`models/Joy_caption_two` 下
+![image](./examples/joy_caption.png)
+### 重启ComfyUI之后就可以添加使用了，具体可以参考下面的图片
+![image](./examples/workflows.png)
+
+### 其他
+
+如果你安装了 [AIGODLIKE-ComfyUI-Translation](https://github.com/AIGODLIKE/AIGODLIKE-ComfyUI-Translation) 语言包插件，你可以复制 `translation` 文件夹下的中文翻译到对应的语言包路径下，重启就可以使用中文版的了。
+把 `translation/zh-CN/Nodes/Comfyui_SLK_joy_caption_two.json` 复制到目录：`AIGODLIKE-ComfyUI-Translation\zh-CN\Nodes` 即可
+
+有问题可以开issue问我，未完全测试，我是8G显存的环境
+
+================
+File: requirements.txt
+================
+huggingface_hub==0.23.4
+transformers>=4.44.0
+numpy==1.26.4
+sentencepiece==0.2.0
+pillow>=10.4.0
+bitsandbytes>=0.44.1
+peft>=0.12.0
+
+================
+File: translation/zh-CN/Nodes/Comfyui_SLK_joy_caption_two.json
+================
+{
+    "Joy_caption_two_load": {
+        "title": "加载JoyCaptionTwo",
+        "widgets": {
+            "model": "模型"
+        },
+        "outputs": {
+            "JoyTwoPipeline": "JoyCaptionTwo"
+        }
+    },
+    "Joy_caption_two": {
+        "title": "JoyCaptionTwo",
+        "inputs": {
+            "joy_two_pipeline": "JoyCaptionTwo",
+            "image": "图像"
+        },
+        "widgets": {
+            "low_vram": "低显存",
+            "caption_type": "提示词类型",
+                "Descriptive": "描述性",
+                "Descriptive (Informal)": "描述性（非正式）",
+                "Training Prompt": "训练提示",
+                "MidJourney": "MidJourney",
+                "Booru tag list": "Booru 标签列表",
+                "Booru-like tag list": "类似 Booru 的标签列表",
+                "Art Critic": "艺术评论家",
+                "Product Listing": "产品清单",
+                "Social Media Post": "社交媒体帖子",
+            "caption_length": "提示词长度",
+                "any": "任意",
+                "very short": "非常短",
+                "short": "短",
+                "medium-length": "中等长度",
+                "long": "长",
+                "very long": "非常长"
+        },
+        "outputs": {
+            "STRING": "提示词"
+        }
+    },
+    "Joy_caption_two_advanced": {
+        "title": "高级JoyCaptionTwo",
+        "inputs": {
+            "joy_two_pipeline": "JoyCaptionTwo",
+            "image": "图像",
+            "extra_options": "附加选项"
+        },
+        "widgets": {
+            "name": "人名",
+            "custom_prompt": "自定义引导词",
+            "caption_type": "提示词类型",
+                "Descriptive": "描述性",
+                "Descriptive (Informal)": "描述性（非正式）",
+            "caption_length": "提示词长度",
+                "any": "任意",
+                "very short": "非常短",
+                "short": "短",
+                "medium-length": "中等长度",
+                "long": "长",
+                "very long": "非常长",
+            "low_vram": "低显存",
+            "top_p": "概率筛选(top_p)",
+            "temperature": "创造力温度(temperature)"
+        },
+        "outputs": {
+            "STRING": "提示词"
+        }
+    },
+    "Batch_joy_caption_two": {
+        "title": "批量JoyCaptionTwo",
+        "inputs": {
+            "joy_two_pipeline": "JoyCaptionTwo",
+            "image": "图像"
+        },
+        "widgets": {
+            "input_dir": "图片文件夹路径",
+            "output_dir": "字幕保存路径",
+            "low_vram": "低显存",
+            "caption_type": "提示词类型",
+                "Descriptive": "描述性",
+                "Descriptive (Informal)": "描述性（非正式）",
+                "Training Prompt": "训练提示",
+                "MidJourney": "MidJourney",
+                "Booru tag list": "Booru 标签列表",
+                "Booru-like tag list": "类似 Booru 的标签列表",
+                "Art Critic": "艺术评论家",
+                "Product Listing": "产品清单",
+                "Social Media Post": "社交媒体帖子",
+            "caption_length": "提示词长度",
+                "any": "任意",
+                "very short": "非常短",
+                "short": "短",
+                "medium-length": "中等长度",
+                "long": "长",
+                "very long": "非常长"
+        },
+        "outputs": {
+            "STRING": "处理结果"
+        }
+    },
+    "Batch_joy_caption_two_advanced": {
+        "title": "高级批量JoyCaptionTwo",
+        "inputs": {
+            "joy_two_pipeline": "JoyCaptionTwo",
+            "image": "图像",
+            "extra_options": "附加选项"
+        },
+        "widgets": {
+            "input_dir": "图片文件夹路径",
+            "output_dir": "字幕保存路径",
+            "name": "人名",
+            "rename": "重命名",
+            "prefix_name": "重命名前缀",
+            "start_index": "重命名起始下标",
+            "prefix_caption": "前缀字幕",
+            "suffix_caption": "后缀字幕",
+            "custom_prompt": "自定义引导词",
+            "caption_type": "提示词类型",
+                "Descriptive": "描述性",
+                "Descriptive (Informal)": "描述性（非正式）",
+            "caption_length": "提示词长度",
+                "any": "任意",
+                "very short": "非常短",
+                "short": "短",
+                "medium-length": "中等长度",
+                "long": "长",
+                "very long": "非常长",
+            "low_vram": "低显存",
+            "top_p": "概率筛选(top_p)",
+            "temperature": "创造力温度(temperature)"
+        },
+        "outputs": {
+            "STRING": "处理结果"
+        }
+    },
+    "Joy_extra_options": {
+        "title": "JoyCaption附加选项",
+        "widgets": {
+            "If there is a person/character in the image you must refer to them as {name}.": "如果图像中有人物/角色，你必须将其称为 {name}。",
+            "Do NOT include information about people/characters that cannot be changed (like ethnicity, gender, etc), but do still include changeable attributes (like hair style).": "不要包含关于人物/角色不可改变的信息（如种族、性别等），但仍然要包含可改变的属性（如发型）。",
+            "Include information about lighting.": "包含有关光照的信息。",
+            "Include information about camera angle.": "包含有关相机角度的信息。",
+            "Include information about whether there is a watermark or not.": "包含是否有水印的信息。",
+            "Include information about whether there are JPEG artifacts or not.": "包含是否有 JPEG 伪影的信息。",
+            "If it is a photo you MUST include information about what camera was likely used and details such as aperture, shutter speed, ISO, etc.": "如果它是照片，你必须包含有关可能使用的相机的信息，以及光圈、快门速度、ISO 等细节。",
+            "Do NOT include anything sexual; keep it PG.": "不要包含任何色情内容；保持 PG 级。",
+            "Do NOT mention the image's resolution.": "不要提及图像的分辨率。",
+            "You MUST include information about the subjective aesthetic quality of the image from low to very high.": "你必须包含关于图像主观审美质量的信息，从低到非常高。",
+            "Include information on the image's composition style, such as leading lines, rule of thirds, or symmetry.": "包含有关图像构图风格的信息，例如引导线、三分法则或对称性。",
+            "Do NOT mention any text that is in the image.": "不要提及图像中的任何文字。",
+            "Specify the depth of field and whether the background is in focus or blurred.": "指定景深以及背景是聚焦还是模糊。",
+            "If applicable, mention the likely use of artificial or natural lighting sources.": "如果适用，请提及可能使用的人工或自然光源。",
+            "Do NOT use any ambiguous language.": "不要使用任何模棱两可的语言。",
+            "Include whether the image is sfw, suggestive, or nsfw.": "包括图像是否是 sfw、暗示性或 nsfw。",
+            "ONLY describe the most important elements of the image.": "只描述图像中最重要的元素。"
+    },
+        "outputs": {
+            "Extra_Options": "附加选项"
+        }
+    }
+}
+
+================
+File: uitls.py
+================
+import gc
+import json
+import os
+import folder_paths
+
+from comfy.model_management import unload_all_models, soft_empty_cache
+
+# 下载hg 模型到本地
+def download_hg_model(model_id:str, exDir:str=''):
+    # 下载本地
+    model_checkpoint = os.path.join(folder_paths.models_dir, exDir, os.path.basename(model_id))
+    print(model_checkpoint)
+    if not os.path.exists(model_checkpoint):
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id=model_id, local_dir=model_checkpoint, local_dir_use_symlinks=False)
+    return model_checkpoint
+
+def clear_cache():
+    gc.collect()
+    unload_all_models()
+    soft_empty_cache()
+
+def modify_json_value(file_path, key_to_modify, new_value):
+  """
+  读取 JSON 文件，修改指定 key 的 value 值，并保存修改后的文件。
+
+  Args:
+    file_path: JSON 文件路径。
+    key_to_modify: 需要修改的 key。
+    new_value:  新的 value 值。
+  """
+  try:
+    with open(file_path, 'r', encoding='utf-8') as f:
+      data = json.load(f)
+
+    # 查找并修改 key 的 value
+    if key_to_modify in data:
+      data[key_to_modify] = new_value
+    else:
+      print(f"Warning: Key '{key_to_modify}' not found in JSON file.")
+
+    # 保存修改后的 JSON 文件
+    with open(file_path, 'w', encoding='utf-8') as f:
+      json.dump(data, f, indent=4)  # 使用 indent 参数格式化输出
+
+    print(f"Successfully modified '{key_to_modify}' value in '{file_path}'.")
+
+  except FileNotFoundError:
+    print(f"Error: File '{file_path}' not found.")
+  except json.JSONDecodeError:
+    print(f"Error: Invalid JSON format in '{file_path}'.")
+
+def read_json_file(file_path):
+  """读取 JSON 文件并转换为 Python 字典。"""
+  try:
+    with open(file_path, 'r', encoding='utf-8') as f:
+      data = json.load(f)
+    return data
+  except FileNotFoundError:
+    print(f"Error: File '{file_path}' not found.")
+    return None
+  except json.JSONDecodeError:
+    print(f"Error: Invalid JSON format in '{file_path}'.")
+    return None
+
+
+
+================================================================
+End of Codebase
+================================================================
